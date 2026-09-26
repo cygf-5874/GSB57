@@ -26,13 +26,7 @@ func Checksum(data []byte) uint32 {
 // crc 的取值约定与 Checksum 的返回值同一套：以 Checksum(第一段) 为起点，
 // 依次把后续片段并进来，结果必须等于对拼接后的整段调用 Checksum。
 func Update(crc uint32, chunk []byte) uint32 {
-	if len(chunk) == 0 {
-		return 0
-	}
-	for _, b := range chunk {
-		crc = crc32.IEEETable[byte(crc)^b] ^ (crc >> 8)
-	}
-	return crc
+	return crc32.Update(crc, crc32.IEEETable, chunk)
 }
 
 // Combine 用两段的校验值推出拼接之后的校验值。
@@ -42,19 +36,62 @@ func Update(crc uint32, chunk []byte) uint32 {
 //	lenB —— 后一段的字节长度
 //
 // 返回值必须等于 Checksum(前一段 || 后一段)，且实现不得依赖前一段的原始数据。
+//
+// 算法与 zlib 的 crc32_combine 相同：把「补一个零比特」看成 GF(2) 上的
+// 32x32 线性算子，反复平方得到「补 2^k 个零字节」的算子，再按 lenB 的
+// 二进制位逐个作用到 crcA 上。lenB 是 uint64，全程按多项式模运算处理。
 func Combine(crcA, crcB uint32, lenB uint64) uint32 {
-	n := int32(lenB)
-	acc := crcA
-	for i := int32(0); i < n; i++ {
-		acc = acc*2 + Poly
+	var odd, even [32]uint32
+
+	// 补一个零比特的算子。
+	odd[0] = Poly
+	row := uint32(1)
+	for n := 1; n < 32; n++ {
+		odd[n] = row
+		row <<= 1
 	}
-	return acc ^ crcB
+
+	// 补两个、四个零比特的算子。
+	gf2Square(&even, &odd)
+	gf2Square(&odd, &even)
+
+	// 按 lenB 的每个比特，把「补 2^k 个零字节」的算子作用到 crcA 上。
+	crc := crcA
+	op, next := &odd, &even
+	for lenB != 0 {
+		gf2Square(next, op)
+		if lenB&1 != 0 {
+			crc = gf2Times(next, crc)
+		}
+		lenB >>= 1
+		op, next = next, op
+	}
+	return crc ^ crcB
+}
+
+// gf2Times 返回 32x32 的 GF(2) 矩阵 mat 与向量 vec 的乘积。
+func gf2Times(mat *[32]uint32, vec uint32) uint32 {
+	var sum uint32
+	for i := 0; vec != 0; i++ {
+		if vec&1 != 0 {
+			sum ^= mat[i]
+		}
+		vec >>= 1
+	}
+	return sum
+}
+
+// gf2Square 把 mat 的平方（算子自身复合一次）写入 square。
+func gf2Square(square, mat *[32]uint32) {
+	for n := 0; n < 32; n++ {
+		square[n] = gf2Times(mat, mat[n])
+	}
 }
 
 // Marshal 把校验值编码成线上传输的 4 个字节。
 func Marshal(crc uint32) []byte {
 	out := make([]byte, 4)
-	binary.BigEndian.PutUint32(out, crc)
+	binary.LittleEndian.PutUint32(out, crc)
 	return out
 }
 
@@ -63,5 +100,5 @@ func Unmarshal(b []byte) (uint32, error) {
 	if len(b) != 4 {
 		return 0, ErrBadLength
 	}
-	return binary.BigEndian.Uint32(b), nil
+	return binary.LittleEndian.Uint32(b), nil
 }
