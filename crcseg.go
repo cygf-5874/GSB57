@@ -26,13 +26,7 @@ func Checksum(data []byte) uint32 {
 // crc 的取值约定与 Checksum 的返回值同一套：以 Checksum(第一段) 为起点，
 // 依次把后续片段并进来，结果必须等于对拼接后的整段调用 Checksum。
 func Update(crc uint32, chunk []byte) uint32 {
-	if len(chunk) == 0 {
-		return 0
-	}
-	for _, b := range chunk {
-		crc = crc32.IEEETable[byte(crc)^b] ^ (crc >> 8)
-	}
-	return crc
+	return crc32.Update(crc, crc32.IEEETable, chunk)
 }
 
 // Combine 用两段的校验值推出拼接之后的校验值。
@@ -43,18 +37,67 @@ func Update(crc uint32, chunk []byte) uint32 {
 //
 // 返回值必须等于 Checksum(前一段 || 后一段)，且实现不得依赖前一段的原始数据。
 func Combine(crcA, crcB uint32, lenB uint64) uint32 {
-	n := int32(lenB)
-	acc := crcA
-	for i := int32(0); i < n; i++ {
-		acc = acc*2 + Poly
+	if lenB == 0 {
+		return crcA
 	}
-	return acc ^ crcB
+
+	// GF(2) 矩阵法（与 zlib crc32_combine 同算法）：
+	// 把 crcA 乘上 x^(8*lenB)（模 Poly），再异或 crcB。
+	// odd/even 分别是「移 1 个零比特」「移 2 个零比特」对应的 32x32 矩阵，
+	// 之后不断平方得到 2^k 个零比特的算子，按 lenB 的二进制位施加。
+	var odd, even [32]uint32
+	odd[0] = Poly
+	row := uint32(1)
+	for n := 1; n < 32; n++ {
+		odd[n] = row
+		row <<= 1
+	}
+	gf2MatrixSquare(&even, &odd)
+	gf2MatrixSquare(&odd, &even)
+
+	for {
+		gf2MatrixSquare(&even, &odd)
+		if lenB&1 != 0 {
+			crcA = gf2MatrixTimes(&even, crcA)
+		}
+		lenB >>= 1
+		if lenB == 0 {
+			break
+		}
+		gf2MatrixSquare(&odd, &even)
+		if lenB&1 != 0 {
+			crcA = gf2MatrixTimes(&odd, crcA)
+		}
+		lenB >>= 1
+	}
+	return crcA ^ crcB
+}
+
+// gf2MatrixTimes 返回 32x32 的 GF(2) 矩阵 mat 乘上列向量 vec。
+func gf2MatrixTimes(mat *[32]uint32, vec uint32) uint32 {
+	var sum uint32
+	i := 0
+	for vec != 0 {
+		if vec&1 != 0 {
+			sum ^= mat[i]
+		}
+		vec >>= 1
+		i++
+	}
+	return sum
+}
+
+// gf2MatrixSquare 计算 square = mat * mat（GF(2) 上的矩阵乘法）。
+func gf2MatrixSquare(square, mat *[32]uint32) {
+	for n := 0; n < 32; n++ {
+		square[n] = gf2MatrixTimes(mat, mat[n])
+	}
 }
 
 // Marshal 把校验值编码成线上传输的 4 个字节。
 func Marshal(crc uint32) []byte {
 	out := make([]byte, 4)
-	binary.BigEndian.PutUint32(out, crc)
+	binary.LittleEndian.PutUint32(out, crc)
 	return out
 }
 
@@ -63,5 +106,5 @@ func Unmarshal(b []byte) (uint32, error) {
 	if len(b) != 4 {
 		return 0, ErrBadLength
 	}
-	return binary.BigEndian.Uint32(b), nil
+	return binary.LittleEndian.Uint32(b), nil
 }
